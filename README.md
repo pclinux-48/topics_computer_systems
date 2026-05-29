@@ -27,6 +27,7 @@ PostgreSQL
 ## Estrutura Do Projeto
 
 - `simulador_stress2.py`: simulador de carga que gera telemetria de sensores, envia mensagens ao Kafka e gera graficos de throughput, latencia e perda de mensagens.
+- `monitor_postgres_tempo_real.py`: rotina Python para subir o Docker e monitorar em tempo real os dados gravados no PostgreSQL.
 - `spark/spark_consumer.py`: consumidor Spark Structured Streaming que le o topico Kafka, processa o JSON, calcula o indice de risco e persiste no PostgreSQL.
 - `spark/startspark.sh`: comando pronto para iniciar o consumidor Spark com os pacotes Kafka e PostgreSQL.
 - `spark/startspark_v`: variacao do script de inicializacao do Spark.
@@ -75,16 +76,24 @@ Portas principais:
 
 ## Persistencia No PostgreSQL
 
-O projeto trabalha com mensagens em JSON e com foco em armazenamento no PostgreSQL usando `JSONB`.
+Observacao importante:
 
-Como nao existe um script SQL no repositorio para criacao automatica da estrutura, crie manualmente uma tabela para persistir o payload e os metadados principais antes da execucao:
+- o `spark_consumer.py` atual grava os dados em formato tabular no PostgreSQL
+- portanto, a tabela real usada hoje nao possui as colunas `id`, `timestamp_evento` e `payload`
+- se voce quiser migrar para `JSONB` de ponta a ponta, sera necessario ajustar o `spark_consumer.py`
+
+Como nao existe um script SQL no repositorio para criacao automatica da estrutura, crie manualmente a tabela abaixo antes da execucao:
 
 ```sql
 CREATE TABLE IF NOT EXISTS historico_sensores (
-    id BIGSERIAL PRIMARY KEY,
-    sensor_id VARCHAR(50),
-    timestamp_evento TIMESTAMP,
-    payload JSONB NOT NULL,
+    sensor_id TEXT,
+    timestamp TIMESTAMPTZ,
+    latitude DOUBLE PRECISION,
+    longitude DOUBLE PRECISION,
+    temperatura DOUBLE PRECISION,
+    umidade DOUBLE PRECISION,
+    co2 DOUBLE PRECISION,
+    status_ia_borda TEXT,
     indice_risco DOUBLE PRECISION
 );
 ```
@@ -95,12 +104,95 @@ Exemplo de acesso ao PostgreSQL no container:
 docker exec -it postgres_db psql -U admin -d incendios_db
 ```
 
-Se desejar otimizar consultas sobre o `payload`, voce pode criar um indice GIN:
+### Monitoramento automatico com Python
+
+Se preferir, voce pode usar a rotina Python do projeto para subir o Docker automaticamente e acompanhar os dados sendo gravados no PostgreSQL em tempo real:
+
+```bash
+cd "/Users/paulocesar/Estudo/Mestrado/Tópicos em Sistemas de Computação /Trabalho/projeto_sensores"
+python3 monitor_postgres_tempo_real.py
+```
+
+Essa rotina:
+
+- executa `docker compose up -d` no diretorio `docker`
+- espera o PostgreSQL ficar disponivel
+- consulta periodicamente os 10 registros mais recentes da tabela `historico_sensores`
+- atualiza a visualizacao no terminal a cada 2 segundos
+
+Observacao:
+
+- essa rotina monitora apenas o PostgreSQL
+- para ver novos dados entrando, o `spark_consumer.py` e o `simulador_stress2.py` devem estar rodando em outros terminais
+
+Comando direto para acessar o PostgreSQL:
+
+```bash
+docker exec -it postgres_db psql -U admin -d incendios_db
+```
+
+### Como visualizar os dados no PostgreSQL em tempo real
+
+Depois de entrar no `psql`, voce pode executar consultas para acompanhar os dados gravados na tabela `historico_sensores`.
+
+Ver os 10 registros mais recentes:
 
 ```sql
-CREATE INDEX IF NOT EXISTS idx_historico_sensores_payload
-ON historico_sensores
-USING GIN (payload);
+SELECT sensor_id, timestamp, temperatura, umidade, co2, status_ia_borda, indice_risco
+FROM historico_sensores
+ORDER BY timestamp DESC
+LIMIT 10;
+```
+
+Ver uma amostra tabular mais compacta:
+
+```sql
+SELECT
+    sensor_id,
+    timestamp,
+    temperatura,
+    umidade,
+    co2,
+    status_ia_borda
+FROM historico_sensores
+ORDER BY timestamp DESC
+LIMIT 10;
+```
+
+Atualizar a consulta automaticamente a cada 2 segundos dentro do `psql`:
+
+```sql
+SELECT sensor_id, timestamp, temperatura, umidade, co2, indice_risco
+FROM historico_sensores
+ORDER BY timestamp DESC
+LIMIT 10;
+\watch 2
+```
+
+Exemplo completo, exatamente na ordem de uso:
+
+```bash
+docker exec -it postgres_db psql -U admin -d incendios_db
+```
+
+```sql
+SELECT sensor_id, timestamp, temperatura, umidade, co2, status_ia_borda, indice_risco
+FROM historico_sensores
+ORDER BY timestamp DESC
+LIMIT 10;
+\watch 2
+```
+
+Se preferir abrir o `psql` e ja executar uma consulta diretamente pelo terminal:
+
+```bash
+docker exec -it postgres_db psql -U admin -d incendios_db -c "SELECT sensor_id, timestamp, temperatura, umidade, co2, status_ia_borda, indice_risco FROM historico_sensores ORDER BY timestamp DESC LIMIT 10;"
+```
+
+Para inspecionar as colunas reais da tabela a qualquer momento:
+
+```bash
+docker exec -it postgres_db psql -U admin -d incendios_db -c "\d historico_sensores"
 ```
 
 Depois disso, execute o `CREATE TABLE`.
@@ -162,7 +254,7 @@ O simulador:
 Responsabilidades:
 
 - simular sensores ESP32 concorrentes
-- gerar payloads JSON compativeis com armazenamento em `JSONB`
+- gerar mensagens JSON para o pipeline Kafka
 - publicar mensagens no Kafka usando `AIOKafkaProducer`
 - medir latencia media de confirmacao de envio
 - calcular throughput
@@ -203,6 +295,15 @@ Observacao:
 
 - esses arquivos sao legados e nao fazem parte do fluxo atual documentado
 
+### `monitor_postgres_tempo_real.py`
+
+Responsabilidades:
+
+- subir a infraestrutura Docker automaticamente
+- aguardar o PostgreSQL responder
+- executar consultas recorrentes na tabela `historico_sensores`
+- mostrar no terminal os registros mais recentes em tempo real
+
 ## Ordem Recomendada De Execucao
 
 Use esta ordem para evitar erro de conexao:
@@ -211,6 +312,7 @@ Use esta ordem para evitar erro de conexao:
 2. criar a tabela `historico_sensores` no PostgreSQL
 3. iniciar o `spark_consumer.py`
 4. executar o `simulador_stress2.py`
+5. opcionalmente executar `monitor_postgres_tempo_real.py` para acompanhar as gravacoes
 
 ## Problemas Comuns
 
@@ -249,9 +351,9 @@ Verifique:
 
 Considere:
 
-- armazenar o payload bruto do sensor em uma coluna `JSONB`
-- manter colunas auxiliares apenas para campos usados com mais frequencia em filtro ou agregacao
-- criar indice GIN quando houver consultas frequentes sobre o `payload`
+- o README acima descreve a estrutura real gravada hoje pelo projeto
+- se quiser usar `JSONB`, o consumidor Spark precisa montar e gravar uma coluna `payload`
+- o modelo `JSONB` e uma evolucao possivel, mas nao corresponde ao schema atual da tabela
 
 ## Resultado Esperado
 
